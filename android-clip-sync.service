@@ -1,0 +1,15 @@
+[Unit]
+Description=Android Screenshot & Media Clipboard Sync for AVF Debian
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/droid/.local/bin/android-clip-sync watch
+Restart=always
+RestartSec=2
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""
+Android Screenshot & Media Clipboard Sync for AVF Debian
+=========================================================
+Automatically syncs Android screenshots and dropped media into wl-clipboard
+and xclip via VirtioFS (/mnt/shared), enabling Ctrl+V media pasting in Antigravity (agy).
+
+How it works:
+-------------
+1. VirtioFS (/mnt/shared):
+   Android host storage (/sdcard) is mounted at /mnt/shared. When a screenshot is taken
+   on Android, it is instantly written to /mnt/shared/Pictures/Screenshots/.
+
+2. Why -loops 0 -i for xclip?
+   In AVF ttyd/terminal sessions, agy runs under DISPLAY=:0 (Xwayland) without WAYLAND_DISPLAY.
+   When Ctrl+V is pressed, agy executes two requests sequentially:
+     - xclip -selection clipboard -t TARGETS -o   (inspect formats)
+     - xclip -selection clipboard -t image/png -o  (fetch payload)
+   Default xclip exits after 1 request (-loops 1), killing the daemon before agy reads the image,
+   causing "Paste failed: exit status 1". Using `-loops 0 -i` keeps xclip alive to serve
+   both requests and repeated pastes.
+
+3. Quick Setup on a fresh AVF Debian VM:
+   $ sudo apt-get update && sudo apt-get install -y xclip wl-clipboard inotify-tools
+   $ mkdir -p ~/.config/systemd/user/
+   $ cat << 'EOF' > ~/.config/systemd/user/android-clip-sync.service
+   [Unit]
+   Description=Android Screenshot & Media Clipboard Sync for AVF Debian
+   After=default.target
+
+   [Service]
+   Type=simple
+   ExecStart=/usr/bin/python3 %h/.local/bin/android-clip-sync watch
+   Restart=always
+   RestartSec=2
+   Environment=DISPLAY=:0
+   Environment=WAYLAND_DISPLAY=wayland-0
+   Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+   [Install]
+   WantedBy=default.target
+   EOF
+   $ systemctl --user daemon-reload && systemctl --user enable --now android-clip-sync.service
+
+Usage:
+------
+  android-clip-sync watch      # Run the real-time background watcher daemon
+  android-clip-sync latest     # Sync the latest media file to clipboard once
+  android-clip-sync <file>     # Copy a specific media file to clipboard
+"""
+
+import os
+import sys
+import time
+import mimetypes
+import subprocess
+from pathlib import Path
+
+WATCH_DIRS = [
+    Path("/mnt/shared/Pictures/Screenshots"),
+    Path("/mnt/shared/.clipboard_drop"),
+    Path("/mnt/shared/Download"),
+]
+
+MEDIA_EXTS = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+    ".txt": "text/plain",
+}
+
+ENV = os.environ.copy()
+ENV["WAYLAND_DISPLAY"] = ENV.get("WAYLAND_DISPLAY", "wayland-0")
+ENV["XDG_RUNTIME_DIR"] = ENV.get("XDG_RUNTIME_DIR", "/run/user/1000")
+ENV["DISPLAY"] = ENV.get("DISPLAY", ":0")
+
+CACHE_FILE = Path("/home/droid/.cache/last_clip_media")
+
+
+def get_mime(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext in MEDIA_EXTS:
+        return MEDIA_EXTS[ext]
+    guess, _ = mimetypes.guess_type(path.name)
+    return guess or "application/octet-stream"
+
+
+def copy_file_to_clipboard(path: Path, use_xclip: bool = False) -> bool:
+    if not path.is_file():
+        return False
+
+    mime = get_mime(path)
+
+    # Wait until file finishes writing (size stable and > 0)
+    prev_size = -1
+    for _ in range(12):
+        try:
+            curr_size = path.stat().st_size
+            if curr_size > 0 and curr_size == prev_size:
+                break
+            prev_size = curr_size
+            time.sleep(0.04)
+        except OSError:
+            time.sleep(0.04)
+
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+
+        # Copy to wl-clipboard (Wayland)
+        try:
+            p = subprocess.Popen(
+                ["wl-copy", "-t", mime],
+                stdin=subprocess.PIPE,
+                env=ENV,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            p.communicate(input=data)
+        except Exception:
+            pass
+
+        # Copy to xclip with -loops 0 daemon (for X11 / Xwayland apps like agy in ttyd)
+        try:
+            subprocess.run(["pkill", "-f", "xclip.*clipboard"], stderr=subprocess.DEVNULL)
+            p2 = subprocess.Popen(
+                ["xclip", "-selection", "clipboard", "-t", mime, "-loops", "0", "-i"],
+                stdin=subprocess.PIPE,
+                env=ENV,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            p2.stdin.write(data)
+            p2.stdin.close()
+        except Exception as e:
+            print(f"[!] xclip error: {e}", file=sys.stderr)
+
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE_FILE.write_text(str(path))
+
+        size_kb = len(data) / 1024
+        print(f"[✓] Synced to clipboard: {path.name} ({mime}, {size_kb:.1f} KB)", flush=True)
+        return True
+    except Exception as e:
+        print(f"[!] Error copying {path}: {e}", file=sys.stderr, flush=True)
+        return False
+
+
+def find_latest_media():
+    candidates = []
+    for d in WATCH_DIRS:
+        if not d.exists():
+            continue
+        try:
+            for entry in os.scandir(d):
+                if entry.is_file():
+                    ext = Path(entry.name).suffix.lower()
+                    if ext in MEDIA_EXTS:
+                        try:
+                            candidates.append((entry.stat().st_mtime, Path(entry.path)))
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def run_daemon(use_xclip: bool = False):
+    print(f"[android-clip-sync] Started low-latency watcher (polling interval: 100ms)", flush=True)
+    for d in WATCH_DIRS:
+        print(f"  Watching: {d}", flush=True)
+
+    dir_mtimes = {}
+    known_latest_files = {}
+
+    for d in WATCH_DIRS:
+        if d.exists():
+            try:
+                dir_mtimes[d] = d.stat().st_mtime
+            except OSError:
+                dir_mtimes[d] = 0
+
+    latest = find_latest_media()
+    if latest:
+        print(f"[android-clip-sync] Initial baseline: {latest.name}", flush=True)
+        try:
+            known_latest_files[latest.parent] = (latest.name, latest.stat().st_mtime)
+        except OSError:
+            pass
+
+    POLL_INTERVAL = 0.10  # 100ms for fast reaction
+
+    while True:
+        try:
+            for d in WATCH_DIRS:
+                if not d.exists():
+                    continue
+                try:
+                    curr_mtime = d.stat().st_mtime
+                except OSError:
+                    continue
+
+                if curr_mtime != dir_mtimes.get(d):
+                    dir_mtimes[d] = curr_mtime
+
+                    newest_file = None
+                    newest_mtime = -1
+
+                    try:
+                        # Quick search in modified directory
+                        for e in os.scandir(d):
+                            if e.is_file():
+                                ext = Path(e.name).suffix.lower()
+                                if ext in MEDIA_EXTS:
+                                    try:
+                                        m = e.stat().st_mtime
+                                        if m > newest_mtime:
+                                            newest_mtime = m
+                                            newest_file = Path(e.path)
+                                    except OSError:
+                                        pass
+                    except OSError:
+                        pass
+
+                    if newest_file:
+                        last_known = known_latest_files.get(d)
+                        if not last_known or (newest_file.name != last_known[0] or newest_mtime > last_known[1]):
+                            known_latest_files[d] = (newest_file.name, newest_mtime)
+                            copy_file_to_clipboard(newest_file, use_xclip=use_xclip)
+
+            time.sleep(POLL_INTERVAL)
+        except KeyboardInterrupt:
+            print("\n[android-clip-sync] Stopped.")
+            break
+        except Exception as e:
+            time.sleep(1)
+
+
+def main():
+    use_xclip = "--no-xclip" not in sys.argv
+    args = [a for a in sys.argv[1:] if a not in ("--xclip", "--no-xclip")]
+
+    if args:
+        cmd = args[0]
+        if cmd in ("watch", "--daemon", "-d"):
+            run_daemon(use_xclip=use_xclip)
+            return
+        elif cmd in ("--help", "-h"):
+            print("Usage: android-clip-sync [watch | latest | /path/to/media] [--xclip]")
+            return
+        elif cmd not in ("latest", "--latest"):
+            target = Path(cmd)
+            if target.is_file():
+                copy_file_to_clipboard(target, use_xclip=use_xclip)
+                return
+            else:
+                print(f"File not found: {target}", file=sys.stderr)
+                sys.exit(1)
+
+    latest = find_latest_media()
+    if latest:
+        copy_file_to_clipboard(latest, use_xclip=use_xclip)
+    else:
+        print("No recent media found in watched directories.")
+
+
+if __name__ == "__main__":
+    main()
