@@ -42,12 +42,12 @@ flowchart LR
 Inside your AVF Debian Terminal, run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<YOUR_USER>/android-clip-sync/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/kush-chou/android-clip-sync/main/install.sh | bash
 ```
 
 *Or clone manually:*
 ```bash
-git clone https://github.com/<YOUR_USER>/android-clip-sync.git
+git clone https://github.com/kush-chou/android-clip-sync.git
 cd android-clip-sync
 ./install.sh
 ```
